@@ -14,9 +14,9 @@ out/
 *.key
 *.pem
 
-# Runtime data
-data/
-logs/
+# Runtime data (anchored so source packages named "data" are not ignored)
+/data/
+/logs/
 *.parquet
 
 # OS
