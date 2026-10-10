@@ -1,0 +1,47 @@
+server:
+  port: 8084
+  servlet:
+    context-path: /api/v1
+
+spring:
+  application:
+    name: ranking-service
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/stockpredict}
+    username: ${SPRING_DATASOURCE_USERNAME:stockpredict}
+    password: ${SPRING_DATASOURCE_PASSWORD:stockpredict}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,info
+
+stockpredict:
+  jwt:
+    issuer: ${STOCKPREDICT_JWT_ISSUER:https://auth.stockpredict.local}
+    audience: ${STOCKPREDICT_JWT_AUDIENCE:stockpredict-api}
+    jwks-uri: ${STOCKPREDICT_JWT_JWKS_URI:http://localhost:8081/api/v1/.well-known/jwks.json}
+  ranking:
+    top-n: 10
+    candidate-pool: 50
+    max-position-weight: 0.10
+    max-sector-weight: 0.25
+    min-position-weight: 0.01
+    volatility-window: 20
+    disclaimer: ${RANKING_DISCLAIMER:Research signal only. Not investment advice.}
+    sector-map-file: ${RANKING_SECTOR_MAP:config/sectors.json}
+    batch-cron: "0 0 2 * * TUE-SAT"
+    scheduling-enabled: ${RANKING_SCHEDULING_ENABLED:true}
+    run-batch-once: ${RANKING_RUN_BATCH_ONCE:false}
+
+logging:
+  level:
+    com.stockpredict: INFO

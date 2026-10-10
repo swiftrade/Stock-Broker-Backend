@@ -1,0 +1,230 @@
+openapi: 3.1.0
+info:
+  title: Market Data Service API
+  version: 1.0.0
+  description: |
+    OHLCV history and quotes for charting. Bars are split/dividend adjusted and
+    sourced from licensed providers; the service attributes the source and marks
+    cached data `stale` during provider outages.
+servers:
+  - url: /api/v1
+tags:
+  - name: MarketData
+paths:
+  /stocks/{symbol}/history:
+    get:
+      tags: [MarketData]
+      operationId: getHistory
+      summary: OHLCV bars for charting
+      parameters:
+        - name: symbol
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Z][A-Z0-9.\-]{0,9}$'
+        - name: interval
+          in: query
+          schema:
+            type: string
+            enum: [1d, 5m]
+            default: 1d
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Inclusive start date (defaults to 5 years ago for 1d, 30 days for 5m)
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Inclusive end date (defaults to the latest trading day)
+      responses:
+        '200':
+          description: Bar series
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BarSeries'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /stocks/{symbol}/quote:
+    get:
+      tags: [MarketData]
+      operationId: getQuote
+      summary: Latest quote
+      parameters:
+        - name: symbol
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Z][A-Z0-9.\-]{0,9}$'
+      responses:
+        '200':
+          description: Quote
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Quote'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /stocks/quotes:
+    get:
+      tags: [MarketData]
+      operationId: getQuotes
+      summary: Latest quotes for multiple symbols
+      parameters:
+        - name: symbols
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+          description: Comma-separated symbols (at most 50); unknown symbols are omitted
+      responses:
+        '200':
+          description: Quotes that passed the sanity guard
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuoteList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /stocks/search:
+    get:
+      tags: [MarketData]
+      operationId: searchSymbols
+      summary: Symbol lookup
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 32
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+      responses:
+        '200':
+          description: Matching symbols
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SymbolSearchResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Missing, expired or invalid credentials
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Unknown symbol
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+    BarSeries:
+      type: object
+      required: [symbol, interval, bars, source, stale]
+      properties:
+        symbol: { type: string }
+        interval: { type: string, enum: [1d, 5m] }
+        source: { type: string, examples: [polygon, alpaca] }
+        stale:
+          type: boolean
+          description: True when served from cache because the provider is unavailable
+        bars:
+          type: array
+          items:
+            $ref: '#/components/schemas/Bar'
+    Bar:
+      type: object
+      required: [ts, open, high, low, close, volume]
+      properties:
+        ts: { type: string, format: date-time }
+        open: { type: number, format: double }
+        high: { type: number, format: double }
+        low: { type: number, format: double }
+        close: { type: number, format: double }
+        volume: { type: integer, format: int64 }
+        vwap: { type: number, format: double }
+        tradeCount: { type: integer, format: int64 }
+    Quote:
+      type: object
+      required: [symbol, bid, ask, last, ts, stale]
+      properties:
+        symbol: { type: string }
+        bid: { type: number, format: double }
+        ask: { type: number, format: double }
+        last: { type: number, format: double }
+        ts: { type: string, format: date-time }
+        stale: { type: boolean }
+    QuoteList:
+      type: object
+      required: [quotes]
+      properties:
+        quotes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Quote'
+    SymbolSearchResult:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/SymbolMatch'
+    SymbolMatch:
+      type: object
+      required: [symbol]
+      properties:
+        symbol: { type: string }
+        name: { type: string }
+        exchange: { type: string }
+security:
+  - bearerAuth: []

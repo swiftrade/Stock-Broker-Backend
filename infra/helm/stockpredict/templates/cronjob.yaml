@@ -1,0 +1,84 @@
+{{- range $name, $job := .Values.batchJobs }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}
+  labels:
+    app: {{ $name }}
+    {{- include "stockpredict.labels" $ | nindent 4 }}
+spec:
+  schedule: {{ $job.schedule | quote }}
+  # CronJob schedules are UTC by default; the batch crons are defined in ET.
+  timeZone: {{ $job.timeZone | default $.Values.global.timeZone | default "America/New_York" | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels: { app: {{ $name }} }
+        spec:
+          restartPolicy: Never
+          securityContext: {{- toYaml ($job.securityContext | default $.Values.securityContext) | nindent 12 }}
+          {{- with $.Values.global.imagePullSecrets }}
+          imagePullSecrets: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: {{ $name }}
+              image: {{ include "stockpredict.image" (dict "Values" $.Values "image" $job.image) }}
+              securityContext: {{- toYaml ($job.containerSecurityContext | default $.Values.containerSecurityContext) | nindent 16 }}
+              env:
+                - name: SPRING_DATASOURCE_URL
+                  value: {{ $.Values.postgres.url | quote }}
+                - name: SPRING_DATASOURCE_USERNAME
+                  valueFrom: { secretKeyRef: { name: {{ $.Values.postgres.secretName }}, key: username } }
+                - name: SPRING_DATASOURCE_PASSWORD
+                  valueFrom: { secretKeyRef: { name: {{ $.Values.postgres.secretName }}, key: password } }
+                - name: SPRING_DATA_REDIS_HOST
+                  value: {{ $.Values.redis.host | quote }}
+                - name: SPRING_DATA_REDIS_PORT
+                  value: {{ $.Values.redis.port | quote }}
+                - name: STOCKPREDICT_JWT_ISSUER
+                  value: {{ $.Values.global.jwtIssuer | quote }}
+                - name: STOCKPREDICT_JWT_AUDIENCE
+                  value: {{ $.Values.global.jwtAudience | quote }}
+                {{- range $k, $v := $job.env }}
+                - name: {{ $k }}
+                  value: {{ $v | quote }}
+                {{- end }}
+              {{- if $job.envFromSecrets }}
+              envFrom:
+                {{- range $secret := $job.envFromSecrets }}
+                - secretRef: { name: {{ $secret }} }
+                {{- end }}
+              {{- end }}
+              resources: {{- toYaml ($job.resources | default $.Values.resources) | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                {{- with $job.volumes }}
+                {{- range . }}
+                - name: {{ .name }}
+                  mountPath: {{ .mountPath }}
+                  {{- if .readOnly }}
+                  readOnly: true
+                  {{- end }}
+                {{- end }}
+                {{- end }}
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            {{- with $job.volumes }}
+            {{- range . }}
+            - name: {{ .name }}
+              {{- if .claimName }}
+              persistentVolumeClaim: { claimName: {{ .claimName }} }
+              {{- else if .secretName }}
+              secret: { secretName: {{ .secretName }} }
+              {{- end }}
+            {{- end }}
+            {{- end }}
+{{- end }}

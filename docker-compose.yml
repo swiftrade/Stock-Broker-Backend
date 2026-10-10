@@ -1,0 +1,89 @@
+name: stockpredict
+
+# Local development infrastructure for the Stock Prediction webservice.
+# `./dev.sh up` starts everything; the app services run in-process via Gradle
+# (`./dev.sh :services:auth-service:bootRun`) or as containers via Helm/Jib.
+services:
+  postgres:
+    # Pinned to a fixed TimescaleDB release + multi-arch manifest digest so
+    # local infra is reproducible (do not use :latest).
+    image: timescale/timescaledb:2.17.2-pg16@sha256:4e459e217f00cbb09920c34d245501e63427e6767a495de57ce76823ff280f12
+    container_name: stockpredict-postgres
+    environment:
+      POSTGRES_DB: stockpredict
+      POSTGRES_USER: stockpredict
+      POSTGRES_PASSWORD: stockpredict
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stockpredict -d stockpredict"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: stockpredict-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # WireMock stubs generated from /contracts. One instance per service so agents
+  # can build against neighbours without waiting for them (coordination rule #3).
+  wiremock-auth:
+    image: wiremock/wiremock:3.9.1
+    container_name: stockpredict-wiremock-auth
+    command: ["--global-response-templating", "--verbose"]
+    ports:
+      - "8191:8080"
+    volumes:
+      - ./stubs/auth-service:/home/wiremock
+
+  wiremock-market-data:
+    image: wiremock/wiremock:3.9.1
+    container_name: stockpredict-wiremock-market-data
+    command: ["--global-response-templating", "--verbose"]
+    ports:
+      - "8092:8080"
+    volumes:
+      - ./stubs/market-data-service:/home/wiremock
+
+  wiremock-prediction:
+    image: wiremock/wiremock:3.9.1
+    container_name: stockpredict-wiremock-prediction
+    command: ["--global-response-templating", "--verbose"]
+    ports:
+      - "8093:8080"
+    volumes:
+      - ./stubs/prediction-service:/home/wiremock
+
+  wiremock-ranking:
+    image: wiremock/wiremock:3.9.1
+    container_name: stockpredict-wiremock-ranking
+    command: ["--global-response-templating", "--verbose"]
+    ports:
+      - "8094:8080"
+    volumes:
+      - ./stubs/ranking-service:/home/wiremock
+
+  wiremock-paper-trading:
+    image: wiremock/wiremock:3.9.1
+    container_name: stockpredict-wiremock-paper-trading
+    command: ["--global-response-templating", "--verbose"]
+    ports:
+      - "8095:8080"
+    volumes:
+      - ./stubs/paper-trading-service:/home/wiremock
+
+volumes:
+  pgdata:
+  redisdata:

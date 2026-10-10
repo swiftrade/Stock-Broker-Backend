@@ -1,0 +1,54 @@
+server:
+  port: 8081
+  servlet:
+    context-path: /api/v1
+
+spring:
+  application:
+    name: auth-service
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/stockpredict}
+    username: ${SPRING_DATASOURCE_USERNAME:stockpredict}
+    password: ${SPRING_DATASOURCE_PASSWORD:stockpredict}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,info
+
+stockpredict:
+  jwt:
+    issuer: ${STOCKPREDICT_JWT_ISSUER:https://auth.stockpredict.local}
+    audience: ${STOCKPREDICT_JWT_AUDIENCE:stockpredict-api}
+    # This service signs its own tokens; it verifies with the local key pair.
+    jwks-uri: ""
+  auth:
+    retention-cron: ${AUTH_RETENTION_CRON:0 30 3 * * *}
+    jwt:
+      key-id: ${AUTH_JWT_KEY_ID:dev-2026-01}
+      private-key-path: ${AUTH_JWT_PRIVATE_KEY_PATH:config/keys/dev-private.pem}
+      public-key-path: ${AUTH_JWT_PUBLIC_KEY_PATH:config/keys/dev-public.pem}
+      allow-key-generation: ${AUTH_JWT_ALLOW_KEY_GENERATION:true}
+      access-token-ttl: PT15M
+      refresh-token-ttl: P7D
+      verification-token-ttl: PT24H
+      login-max-failures: 5
+      login-window: PT15M
+      login-retention-days: ${AUTH_LOGIN_RETENTION_DAYS:30}
+      token-retention-days: ${AUTH_TOKEN_RETENTION_DAYS:30}
+
+logging:
+  level:
+    com.stockpredict: INFO

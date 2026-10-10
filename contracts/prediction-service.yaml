@@ -1,0 +1,222 @@
+openapi: 3.1.0
+info:
+  title: Prediction Service API
+  version: 1.0.0
+  description: |
+    Batch-precomputed intraday predictions (1d / 5d / 20d horizons) served
+    from Postgres + Redis. API calls never run model inference inline. Every
+    response carries the model version, as-of date and the research disclaimer.
+servers:
+  - url: /api/v1
+tags:
+  - name: Predictions
+paths:
+  /predictions/intraday:
+    get:
+      tags: [Predictions]
+      operationId: getIntradayPredictions
+      summary: Today's ranked predictions
+      parameters:
+        - name: date
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Defaults to the latest available as-of date
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5000
+            default: 100
+          description: FREE plan is capped server-side at the top 20
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [predicted_return_desc, p_up_desc, symbol_asc]
+            default: predicted_return_desc
+      responses:
+        '200':
+          description: Ranked prediction list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PredictionList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /predictions/intraday/{symbol}:
+    get:
+      tags: [Predictions]
+      operationId: getSymbolPrediction
+      summary: One symbol's multi-horizon predictions and feature snapshot
+      parameters:
+        - name: symbol
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Z][A-Z0-9.\-]{0,9}$'
+      responses:
+        '200':
+          description: Symbol prediction
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SymbolPrediction'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /predictions/model-info:
+    get:
+      tags: [Predictions]
+      operationId: getModelInfo
+      summary: Active model version and published validation metrics
+      responses:
+        '200':
+          description: Model info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelInfo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Missing, expired or invalid credentials
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Not found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+    PredictionList:
+      type: object
+      required: [asOf, modelVersion, stale, disclaimer, predictions]
+      properties:
+        asOf: { type: string, format: date }
+        modelVersion: { type: string }
+        stale:
+          type: boolean
+          description: True when the batch job has not produced today's run
+        disclaimer: { type: string }
+        predictions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Prediction'
+    Prediction:
+      type: object
+      required: [symbol, rank, predictedLogReturn, predictedPctChange, pUp, currentClose, predictedPrice]
+      properties:
+        symbol: { type: string }
+        rank: { type: integer }
+        predictedLogReturn:
+          type: number
+          format: double
+          description: Predicted EXCESS log return (stock minus SPY); the model target is excess return
+        predictedPctChange:
+          type: number
+          format: double
+          description: (exp(predictedLogReturn) - 1) * 100; excess return, not absolute
+        pUp:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: Probability the 1d forward return is positive
+        confidence:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        currentClose: { type: number, format: double }
+        predictedPrice:
+          type: number
+          format: double
+          description: |
+            currentClose * exp(predictedLogReturn). Because the prediction is an
+            EXCESS return, this price embeds a "SPY flat" assumption and is not
+            an absolute price forecast; rank/ordering consumers are unaffected.
+    HorizonPrediction:
+      type: object
+      required: [horizonDays, predictedLogReturn, predictedPrice]
+      properties:
+        horizonDays: { type: integer }
+        predictedLogReturn:
+          type: number
+          format: double
+          description: Predicted EXCESS log return (stock minus SPY)
+        predictedPrice:
+          type: number
+          format: double
+          description: currentClose * exp(predictedLogReturn); excess return implies a "SPY flat" assumption
+        predictedPctChange: { type: number, format: double }
+    SymbolPrediction:
+      type: object
+      required: [symbol, asOf, modelVersion, stale, disclaimer, horizons]
+      properties:
+        symbol: { type: string }
+        asOf: { type: string, format: date }
+        modelVersion: { type: string }
+        stale: { type: boolean }
+        disclaimer: { type: string }
+        horizons:
+          type: array
+          items:
+            $ref: '#/components/schemas/HorizonPrediction'
+        features:
+          type: object
+          additionalProperties: true
+          description: Feature snapshot used for the prediction (research transparency)
+    ModelInfo:
+      type: object
+      required: [version, trainedAt, horizons, disclaimer]
+      properties:
+        version: { type: string }
+        trainedAt: { type: string, format: date-time }
+        horizons:
+          type: array
+          items:
+            $ref: '#/components/schemas/HorizonMetrics'
+        disclaimer: { type: string }
+    HorizonMetrics:
+      type: object
+      required: [horizonDays]
+      properties:
+        horizonDays: { type: integer }
+        directionAccuracy: { type: number, format: double }
+        rmse: { type: number, format: double }
+        cvFolds: { type: integer }
+security:
+  - bearerAuth: []

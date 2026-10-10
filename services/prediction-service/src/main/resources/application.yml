@@ -1,0 +1,53 @@
+server:
+  port: 8083
+  servlet:
+    context-path: /api/v1
+
+spring:
+  application:
+    name: prediction-service
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/stockpredict}
+    username: ${SPRING_DATASOURCE_USERNAME:stockpredict}
+    password: ${SPRING_DATASOURCE_PASSWORD:stockpredict}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,info
+
+stockpredict:
+  jwt:
+    issuer: ${STOCKPREDICT_JWT_ISSUER:https://auth.stockpredict.local}
+    audience: ${STOCKPREDICT_JWT_AUDIENCE:stockpredict-api}
+    jwks-uri: ${STOCKPREDICT_JWT_JWKS_URI:http://localhost:8081/api/v1/.well-known/jwks.json}
+  predictions:
+    model-dir: ${PREDICTION_MODEL_DIR:models}
+    disclaimer: ${PREDICTION_DISCLAIMER:Research signal only. Not investment advice.}
+    free-plan-limit: 20
+    cache-ttl-seconds: 60
+    include-per-stock: true
+    history-days: 500
+    horizons: 1,5,20
+    prediction-delay: 1
+    residualize-features: true
+    use-excess-return-target: true
+    batch-cron: "0 30 8 * * MON-FRI"
+    scheduling-enabled: ${PREDICTION_SCHEDULING_ENABLED:true}
+    run-batch-once: ${PREDICTION_RUN_BATCH_ONCE:false}
+
+logging:
+  level:
+    com.stockpredict: INFO

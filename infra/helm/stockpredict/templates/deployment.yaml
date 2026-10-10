@@ -1,0 +1,101 @@
+{{- range $name, $svc := .Values.services }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    app: {{ $name }}
+    {{- include "stockpredict.labels" $ | nindent 4 }}
+spec:
+  replicas: {{ $svc.replicas | default 2 }}
+  selector:
+    matchLabels: { app: {{ $name }} }
+  template:
+    metadata:
+      labels: { app: {{ $name }} }
+    spec:
+      securityContext: {{- toYaml ($svc.securityContext | default $.Values.securityContext) | nindent 8 }}
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if gt (int ($svc.replicas | default 2)) 1 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: {{ $name }} }
+      {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "stockpredict.image" (dict "Values" $.Values "image" $svc.image) }}
+          ports:
+            - containerPort: {{ $svc.port }}
+          securityContext: {{- toYaml ($svc.containerSecurityContext | default $.Values.containerSecurityContext) | nindent 12 }}
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: prod
+            - name: SPRING_DATASOURCE_URL
+              value: {{ $.Values.postgres.url | quote }}
+            - name: SPRING_DATASOURCE_USERNAME
+              valueFrom: { secretKeyRef: { name: {{ $.Values.postgres.secretName }}, key: username } }
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ $.Values.postgres.secretName }}, key: password } }
+            - name: SPRING_DATA_REDIS_HOST
+              value: {{ $.Values.redis.host | quote }}
+            - name: SPRING_DATA_REDIS_PORT
+              value: {{ $.Values.redis.port | quote }}
+            - name: STOCKPREDICT_JWT_ISSUER
+              value: {{ $.Values.global.jwtIssuer | quote }}
+            - name: STOCKPREDICT_JWT_AUDIENCE
+              value: {{ $.Values.global.jwtAudience | quote }}
+            - name: STOCKPREDICT_JWT_JWKS_URI
+              value: {{ $.Values.global.jwtJwksUri | quote }}
+            - name: JAVA_TOOL_OPTIONS
+              value: {{ $svc.javaOpts | default "-XX:MaxRAMPercentage=70" | quote }}
+            {{- range $k, $v := $svc.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          {{- if $svc.envFromSecrets }}
+          envFrom:
+            {{- range $secret := $svc.envFromSecrets }}
+            - secretRef: { name: {{ $secret }} }
+            {{- end }}
+          {{- end }}
+          readinessProbe:
+            httpGet: { path: /api/v1/actuator/health/readiness, port: {{ $svc.port }} }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /api/v1/actuator/health/liveness, port: {{ $svc.port }} }
+            initialDelaySeconds: 40
+            periodSeconds: 15
+          resources: {{- toYaml ($svc.resources | default $.Values.resources) | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- with $svc.volumes }}
+            {{- range . }}
+            - name: {{ .name }}
+              mountPath: {{ .mountPath }}
+              {{- if .readOnly }}
+              readOnly: true
+              {{- end }}
+            {{- end }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- with $svc.volumes }}
+        {{- range . }}
+        - name: {{ .name }}
+          {{- if .claimName }}
+          persistentVolumeClaim: { claimName: {{ .claimName }} }
+          {{- else if .secretName }}
+          secret: { secretName: {{ .secretName }} }
+          {{- end }}
+        {{- end }}
+        {{- end }}
+{{- end }}

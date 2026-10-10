@@ -1,0 +1,47 @@
+server:
+  port: 8085
+  servlet:
+    context-path: /api/v1
+
+spring:
+  application:
+    name: paper-trading-service
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/stockpredict}
+    username: ${SPRING_DATASOURCE_USERNAME:stockpredict}
+    password: ${SPRING_DATASOURCE_PASSWORD:stockpredict}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,info
+
+stockpredict:
+  jwt:
+    issuer: ${STOCKPREDICT_JWT_ISSUER:https://auth.stockpredict.local}
+    audience: ${STOCKPREDICT_JWT_AUDIENCE:stockpredict-api}
+    jwks-uri: ${STOCKPREDICT_JWT_JWKS_URI:http://localhost:8081/api/v1/.well-known/jwks.json}
+  paper:
+    starting-cash: 100000
+    free-plan-watchlist-limit: 10
+    watchlist-swap-lock-days: 30
+    slippage-bps: 5
+    allow-after-hours: false
+    match-interval-ms: 5000
+    market-data-url: ${MARKET_DATA_SERVICE_URL:http://localhost:8082}
+    quote-timeout-ms: 1500
+    snapshot-cron: ${PAPER_SNAPSHOT_CRON:0 5 16 * * MON-FRI}
+    expiry-cron: ${PAPER_EXPIRY_CRON:0 5 16 * * MON-FRI}
+    run-match-once: ${PAPER_RUN_MATCH_ONCE:false}
+
+logging:
+  level:
+    com.stockpredict: INFO

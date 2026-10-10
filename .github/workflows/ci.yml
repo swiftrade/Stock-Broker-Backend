@@ -1,0 +1,141 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, unit + integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install native runtime for XGBoost4J
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgomp1
+
+      - name: Build (compile + unit tests + jars)
+        run: ./gradlew build --no-daemon
+
+      - name: Integration tests (Testcontainers)
+        run: ./gradlew test -PincludeIntegrationTests=true --no-daemon
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: "**/build/reports/tests/**"
+          if-no-files-found: ignore
+
+      - name: Trivy filesystem scan (vulnerabilities + secrets)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: End-to-end journeys (staging)
+        if: ${{ vars.E2E_BASE_URL != '' }}
+        env:
+          E2E_VERIFY_TOKEN: ${{ secrets.E2E_VERIFY_TOKEN }}
+        run: |
+          ./gradlew :tests:e2e:test \
+            -Pe2eBaseUrl="${{ vars.E2E_BASE_URL }}" \
+            -Pe2eToken="${{ secrets.E2E_TOKEN }}" --no-daemon
+
+      - name: OWASP ZAP baseline scan (staging)
+        if: ${{ vars.E2E_BASE_URL != '' }}
+        run: |
+          chmod +x tests/security/zap-baseline.sh
+          ./tests/security/zap-baseline.sh "${{ vars.E2E_BASE_URL }}"
+
+      - name: Upload ZAP report
+        if: ${{ always() && vars.E2E_BASE_URL != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: tests/security/reports/
+          if-no-files-found: ignore
+
+  openapi:
+    name: OpenAPI breaking-change check (${{ matrix.spec }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        spec:
+          - contracts/auth-service.yaml
+          - contracts/market-data-service.yaml
+          - contracts/paper-trading-service.yaml
+          - contracts/prediction-service.yaml
+          - contracts/ranking-service.yaml
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch base branch
+        run: git fetch origin "${{ github.base_ref }}" --depth=1
+
+      - name: Materialize base spec
+        id: base
+        run: |
+          if git show "origin/${{ github.base_ref }}:${{ matrix.spec }}" > base-spec.yaml 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "New spec (no base version): ${{ matrix.spec }}"
+          fi
+
+      # Pinned to an exact action release instead of downloading an
+      # oasdiff binary from releases/latest (supply-chain hygiene).
+      - name: oasdiff ${{ matrix.spec }}
+        if: steps.base.outputs.exists == 'true'
+        uses: oasdiff/oasdiff-action/breaking@v0.1.18
+        with:
+          base: base-spec.yaml
+          revision: ${{ matrix.spec }}
+          fail-on: ERR
+          review: false
+
+  images:
+    name: Container images (Jib)
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build OCI image tars
+        run: ./gradlew jibBuildTar --no-daemon
+
+      - name: Upload image tars
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-tars
+          path: "services/*/build/jib-image.tar"
+          if-no-files-found: error

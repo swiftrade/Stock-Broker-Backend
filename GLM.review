@@ -1,0 +1,347 @@
+# GLM.review — Thorough code review of `stockpredict` (JAVAWEBSERVICE)
+
+- **Date:** 2026-10-09
+- **Scope:** all 6 services, common-lib, feature-engine, db-migrations, ml-export, gateway, infra (Helm/CI/docker), tests — ~14k LOC / 160 Java files
+- **Method:** line-by-line read of all main sources; flows traced end-to-end (register → login → JWT verify → gateway pre-check → service verify → money path; ingestion → features → inference → ranking → serving). Suspicious findings were verified against the actual code, and the riskiest claims were tested empirically (see Appendix C — three candidate "bugs" turned out to be fine and are documented there on purpose).
+- **Reviewer model:** GLM (accounts/fireworks/routers/glm-latest)
+
+## Executive summary
+
+The codebase is well above average for a project of this kind: contract-first codegen, RFC 7807 everywhere, a genuinely rigorous Python-parity harness, textbook refresh-token rotation, conditional SQL updates that make the order lifecycle race-safe, and a property-based ledger test. The dominant risks are **not** the classic ones (auth bypass, SQL injection, XSS) — those are handled. They are:
+
+1. **A timezone off-by-one in the ML pipeline** that labels predictions with the wrong session date and makes the `stale` flag permanently `true` in production timing (H1).
+2. **Contract constraints that are documented but never enforced** (password policy, required fields) plus NPE→500s on malformed bodies (H2).
+3. **Helm batch CronJobs that cannot work as shipped** (no model volume, no API key secret, UTC-vs-ET schedules) (H3).
+4. **No price sanity check on the quote path** feeding the paper matching engine — a zero bid/ask/last fills orders at 0 (H4).
+5. A handful of **concurrency gaps in the money path** (position lost-updates across replicas, non-atomic reset, refresh-rotation race) (H5/H6/M8/M9).
+
+| Severity | Count |
+| --- | --- |
+| HIGH | 6 |
+| MEDIUM | 18 |
+| LOW | 20 |
+
+---
+
+## HIGH findings
+
+### H1. Daily-bar session-date off-by-one: `as_of` lands on the wrong (often non-trading) day and `stale` is permanently true
+
+**Where:**
+- `services/market-data-service/.../provider/SyntheticProvider.java:150` — daily bars stamped `date.atStartOfDay(ZoneOffset.UTC)` (00:00Z of the *session* date)
+- `services/market-data-service/.../provider/PolygonProvider.java:85` — Polygon day aggregates `t` are UTC midnight of the session date; stored verbatim
+- `services/prediction-service/.../service/PredictionBatchService.java:79` — `LocalDate asOf = tradingCalendar.sessionDate(latest)`
+- `common-lib/.../time/TradingCalendar.java:88-90` — `sessionDate` = `instant.atZone(America/New_York).toLocalDate()`
+- `services/prediction-service/.../service/PredictionQueryService.java:146-149` — `isStale` compares `asOf` to `previousTradingDay(todayEt)`
+- `services/ranking-service/.../data/PredictionSource.java:70-72` — vol window bound `ts < asOf+1 00:00Z`
+
+**Evidence:** `00:00Z` on session date D is 19:00/20:00 ET on calendar day D−1. `sessionDate(D 00:00Z)` therefore returns **D−1**, not D. Concrete trace: batch runs Tue 08:30 ET; the latest bar is Monday's session stamped `Mon 00:00Z`; `sessionDate` → **Sunday**. Predictions get `as_of = Sunday` (a non-trading date). `isStale`: `previousTradingDay(Tue) = Mon`, `Sun < Mon` → `stale=true` — always, even seconds after a fresh batch. The ranking service inherits the same shifted `as_of`, and its volatility window (`ts < asOf+1 00:00Z`) then excludes the newest daily bar, computing realized vol one session stale relative to the features actually used.
+
+**Inconsistency proof within the repo:** `MarketDataController.isStale` (market-data-service, lines 200-203) interprets the *same* daily-bar timestamp correctly as a UTC date (`last.atZoneSameInstant(ZoneOffset.UTC).toLocalDate()`), while prediction/ranking interpret it as an ET instant. Two services, two conventions, one wrong.
+
+**Why it matters:** `as_of` is the identity key of a prediction (`UNIQUE (model_version, as_of, symbol, horizon_days)`), drives staleness semantics, and gates the ranking volatility window. In production timing every prediction response would carry `stale: true` and `as_of` would frequently be a weekend/holiday date, breaking the acceptance criterion "predictions present with model version and stale flag".
+
+**Fix options (pick one and centralize):**
+1. Stamp daily bars at the session close (e.g., 16:00 ET) at ingestion, so ET-based `sessionDate` works for both bar types; or
+2. Keep the UTC-midnight convention and map daily-bar timestamps to session dates as UTC dates (a `BarTimestamps`/`SessionDates` utility in common-lib used by *all* consumers, replacing ad-hoc `sessionDate` calls).
+Add a regression test: ingest a synthetic Monday bar, run the batch, assert `as_of == Monday` and `stale == false` on Tuesday morning.
+
+### H2. Contract validation is not enforced anywhere: password policy ignored, malformed bodies produce NPE→500
+
+**Where:**
+- `contracts/auth-service.yaml:256-266` — `RegisterRequest` requires `email`, `password`; `password minLength: 12`
+- `services/auth-service/build.gradle.kts` — `annotationLibrary: none` in `openApiGenerate` → generated models carry no Jakarta validation
+- `services/auth-service/.../web/AuthController.java:33-36` — no `@Valid`/`@Validated`
+- `services/auth-service/.../service/AuthService.java:66-94` — no length/null guard; `passwordEncoder.encode(request.getPassword())` at line 78
+
+**Evidence:** `POST /auth/register` with `{"email":"a@b.c","password":"x"}` is **accepted** (policy says ≥12). `POST /auth/register` with `{}` reaches `Argon2PasswordEncoder.encode(null)` → `IllegalArgumentException` → `GlobalExceptionHandler.handleUnexpected` → **500 INTERNAL** instead of RFC 7807 `VALIDATION_FAILED` 400. Same class of failure in `verifyEmail` (`AuthService.java:183` — `TokenHasher.sha256Hex(request.getToken())` NPEs on a missing token) and `resendVerification` (null email survives to a useless DB query).
+
+**Fix:** enable `annotationLibrary: springDoc`/validation in the generator (or add explicit `@Valid` + hand-written constraint annotations) and validate in `AuthService.register` before any encoding/DB work; map `HttpMessageNotReadable`/null-field failures to `VALIDATION_FAILED` per the README error table.
+
+### H3. Helm batch CronJobs cannot work as shipped (missing volumes, secrets, timezone)
+
+**Where:** `infra/helm/stockpredict/templates/cronjob.yaml` + `values.yaml:66-87`
+
+**Evidence, three independent defects:**
+1. `prediction-batch` CronJob has **no model PVC mount and no `PREDICTION_MODEL_DIR`** (the Deployment gets `volumes: stockpredict-models` + `/models/active`; the CronJob template renders only `job.env`). The one-shot batch will start with `model-dir=models` (relative CWD), find nothing, and fail every night with `UNPROCESSABLE`.
+2. `market-data-ingest` CronJob has **no `envFromSecrets`** (only the Deployment wires `stockpredict-market-data`), so the ingest job silently runs the **synthetic provider** in production — real data never ingested, no error visible.
+3. CronJob `schedule` is UTC by default (no `timeZone:` field): `ranking-batch "0 2 * * TUE-SAT"` UTC = 21:00/22:00 **ET the previous evening** — ranking runs before the same-day prediction batch and stamps `run_date` a day early; `prediction-batch "30 8"` UTC = 04:30 ET. Additionally, Deployments keep the in-pod `@Scheduled(zone="America/New_York")` jobs *and* the CronJobs run — double execution (idempotent upserts mask it, but ranking creates duplicate history rows because `run_date` differs).
+
+Also: CronJob pods have **no `resources` block at all**, and no `SPRING_DATA_REDIS_HOST` where a job needs Redis.
+
+**Fix:** add `timeZone: America/New_York` (k8s ≥1.27), render `volumes`, `envFromSecrets`, `resources` into the CronJob template from the same per-service config, and decide one execution model (either disable in-pod scheduling when the CronJob exists, or drop the CronJobs).
+
+### H4. No price sanity check on the quote path — a zero/absent bid/ask/last fills paper orders at 0
+
+**Where:**
+- `services/market-data-service/.../provider/PolygonProvider.java:175-183` — `doubleOrNull` accepts `0.0` (`value.isNumber()`), and lines 141-155 will happily produce `bid=0, ask=0, last=0` (or a one-sided 0) from an empty NBBO
+- `services/market-data-service/.../web/MarketDataController.java:109-133` — `getQuote` passes the snapshot through (cached 60 s) with no `> 0` / spread sanity check
+- `services/paper-trading-service/.../engine/MatchingEngine.java:61-88` — MARKET BUY fills at `last*(1+slip)` (=0 → free shares), MARKET SELL fills at 0 (position annihilated at zero proceeds), LIMIT BUY triggers on `ask(0) <= limit`
+
+**Evidence:** bars are protected by `IngestionQualityGuard.priceIssue` (lines 99-117) — but quotes bypass the guard entirely. Polygon returns `bp=0/ap=0` for no-book tickers; the paper `MarketDataQuoteClient` (lines 44-52) only checks `last == null`, not `last <= 0`.
+
+**Fix:** validate `QuoteSnapshot` (all of bid/ask/last > 0, ask ≥ bid) at the market-data boundary before caching/serving; defensively re-check in `MatchingEngine.evaluate` and treat invalid quotes as "no quote" (fall back to the daily close). Add a test: quote with `last=0` must never produce a fill.
+
+### H5. Position ledger is vulnerable to lost updates under concurrent pollers (multi-replica)
+
+**Where:**
+- `services/paper-trading-service/.../data/JdbcPositionRepository.java:45-56` — plain `INSERT ... ON CONFLICT DO UPDATE SET quantity = EXCLUDED.quantity` (full overwrite)
+- `services/paper-trading-service/.../service/FillService.java:57-99` — position read at line 59 (no lock), written later
+- `services/paper-trading-service/.../job/MatchingJob.java:21` — `@Scheduled` poller runs on **every** replica; Helm sets `replicas: 2`
+
+**Evidence:** `fillIfWorking` (`JdbcOrderRepository.java:138-144`) is a correctly guarded conditional update, so the *same* order can't fill twice. But two different working BUY orders for the same `(account, symbol)` on two replicas both read `position.quantity=10`, both compute `10+q`, and the second upsert overwrites the first — cash is debited twice (account version protects the sum) while the position shows one fill. The reconciliation invariant `cash + qty·avgEntry = starting + realizedPnl` is silently broken. The account row's optimistic version does not serialize position writes.
+
+**Fix (pick one):**
+- `SELECT ... FOR UPDATE` on the account row at the start of `applyFill` (pessimistic per-account serialization — simplest and matches the ledger intent);
+- or add `version` to `positions` and optimistic retry;
+- or make the position upsert an atomic increment (`SET quantity = positions.quantity + ?`) with a guarded avg-entry formula;
+- plus a leader lock (ShedLock) or single-replica scheduling for `MatchingJob` (see D5).
+
+### H6. Refresh-token rotation is not concurrency-safe; reuse detection can be bypassed
+
+**Where:** `services/auth-service/.../service/AuthService.java:122-155` + `repository/RefreshTokenRepository.java:14-19`
+
+**Evidence:** `refresh` does check-then-act: `findByTokenHash` (plain read) → `if (token.getRevokedAt() != null) revoke family`. Two concurrent requests replaying the **same** stolen token both read `revoked_at = null` (MVCC snapshot), both pass the guard, both rotate — leaving two valid tokens in the family and no theft signal. `revokeFamily` is a bulk update but nothing makes the initial read exclusive.
+
+**Fix:** lock the row (`@Lock(PESSIMISTIC_WRITE)` on a `findByTokenHashForUpdate`), or flip the guard to a conditional update (`UPDATE ... SET revoked_at = now() WHERE token_hash = ? AND revoked_at IS NULL` returning rows==0 → treat as reuse → revoke family). The same pattern would also make `logout` race-safe.
+
+---
+
+## MEDIUM findings
+
+### M1. `PredictionBatchService.run` holds a transaction for the whole batch and builds a boxed, multi-GB feature table
+
+**Where:** `PredictionBatchService.java:71-130` (`@Transactional` over inference for ~500 symbols × horizons), `libs/feature-engine/.../FeatureTable.java:70` (per-row `LinkedHashMap<String, Double>`), `FeatureEngine.sanitize` (`FeatureEngine.java:384-393` — `table.columns()` is a **defensive copy per row**), `featuresJson` (`PredictionBatchService.java:193-204`, JSON serialized for every row inside the TX).
+
+S&P-500 × 500 calendar days ≈ 250k rows × ~90 columns ≈ 22M boxed `Double`s + map overhead → several GB heap and heavy GC, with a DB connection and TX held open during minutes of XGBoost inference. Split it: compute outside the TX, then a short write TX (upserts already batched). Consider columnar storage (`double[][]` per column) in `FeatureTable` — an order-of-magnitude heap reduction — and hoist the `columns()` copy out of the row loop in `sanitize`.
+
+### M2. Quote fan-out (N+1 HTTP) on portfolio, positions and snapshots
+
+**Where:** `AccountService.positions/portfolio` (`AccountService.java:67-107`) and `SnapshotService.snapshotAll` (`SnapshotService.java:47-59`) call `quoteProvider.quote(symbol)` per position per account through the composite (HTTP → market-data, 1.5 s timeout). The EOD snapshot iterates **all accounts × all positions** — thousands of sequential HTTP calls; if market-data is degraded each call burns up to the full timeout. The matching poller likewise re-quotes every working order every 5 s (`MatchingEngine.java:42-53`). Batch it: a multi-symbol quote endpoint (or read latest closes directly from `bars_daily` for snapshot marking, which is the same data the DB fallback would give).
+
+### M3. Prediction universe is "whatever is in `bars_daily`" — user-triggered on-demand ingestion pollutes it
+
+**Where:** `MarketDataController.getHistory` → `ingestOnDemand` (`MarketDataController.java:171-190`) ingests **any** symbol any authenticated user asks for; `PredictionBatchService` uses `barRepository.listSymbols()` as the prediction universe (`PredictionBatchService.java:81`); `MarketDataJobs.trackedSymbols()` (`MarketDataJobs.java:66-71`) makes the 5-minute live refresh ingest every symbol ever seen. A user searching one OTC ticker makes it a prediction target and a permanent intraday-ingestion load. Restrict on-demand ingestion (whitelist/universe check, or a separate table/flag for "requested" vs "universe" symbols), and make the batch universe explicit (S&P 500 list).
+
+### M4. HTTP clients with no timeouts can hang ingestion and registration indefinitely
+
+**Where:** `MarketDataConfig.polygonRestClient` (`MarketDataConfig.java:31-34`), `BreachedPasswordChecker` (`BreachedPasswordChecker.java:27-29`) — both `RestClient.builder().build()` with default (infinite) connect/read timeouts. `fetchAggregates` loops up to 50 pages; a stalled connection wedges the nightly ingestion (and `@Scheduled` single-thread executor stops all other jobs in that pod). Retry/CircuitBreaker cannot compensate for infinite timeouts. Set explicit connect/read timeouts on both (the paper quote client already does this correctly — copy that pattern).
+
+### M5. Redis stream `bars.updated` grows unboundedly and has no consumer
+
+**Where:** `BarsUpdatedPublisher.publish` (`BarsUpdatedPublisher.java:36-60`) — plain `XADD`, no `MAXLEN ~` trimming, one event per symbol per interval, forever. Nothing in the repo reads the stream yet. Either trim (`XADD ... MAXLEN ~ 100000`) or defer publishing until the consumer exists.
+
+### M6. Nightly ingestion re-backfills 5 years for the whole universe every night
+
+**Where:** `IngestionService.ingestDaily` (`IngestionService.java:42-46`) always passes `backfillYears`; `MarketDataJobs.dailyRefresh` (`MarketDataJobs.java:40-50`) calls it nightly → ~500 provider requests and ~600k row upserts per night for data that is one day newer. Ingest the delta (`from = last stored ts + 1 day`) with the full backfill only on first sight of a symbol; note Polygon free tier (5 req/min) makes the current design take hours.
+
+### M7. Dust-drop renormalization in `PortfolioWeights` can breach the caps it just enforced
+
+**Where:** `PortfolioWeights.inverseVolatility` (`PortfolioWeights.java:62-80`) — caps are enforced on `combined`/`sectorCapped`, then weights `< minPositionWeight` are zeroed and everything renormalized by `result[i] /= total`. Example: nine names at 0.099 and one dust name at 0.010 → after drop-and-renormalize the others become 0.11 > 0.10 position cap (sector cap can breach the same way). `PortfolioWeightsTest.dustPositionsAreDropped...` runs with caps disabled (1.0) so this is untested. Either re-run the cap enforcement after dust-drop, or drop dust before `enforceBothCaps`, or document the post-drop relaxation explicitly.
+
+### M8. `AccountService.reset` (and `WatchlistService.replace`) are not transactional
+
+**Where:** `AccountService.reset` (`AccountService.java:56-65`) — three separate auto-commit statements (`cancelWorkingForAccount`, `deleteByAccount`, `reset`). A crash mid-way leaves orders cancelled but cash un-reset; a fill interleaved between statements can deduct cash against `starting_cash` with its position row already deleted. `WatchlistService.replace` (`WatchlistService.java:56-86`) — `replaceAll` then `setWatchlistLock` can lose the lock on crash (watchlist replaced, no 30-day lock). Add `@Transactional` to both (the fill path already is).
+
+### M9. `stockpredict.jwt.clock-skew` is silently ignored by every servlet service
+
+**Where:** `JwtProperties.clockSkew` (`common-lib/.../security/JwtProperties.java:20`) is bound but never used — `CommonAutoConfiguration.jwtVerifier` (`CommonAutoConfiguration.java:56-62`) constructs `JwtVerifier` via the 3-arg constructor (default 30 s skew, `Clock.systemUTC()`), while the gateway **does** honor `properties.getClockSkew()` (`JwtPreCheckFilter.java:46-53`). Config is accepted and ignored on one side of the fence, honored on the other — a drift trap. Wire `properties.getClockSkew()` (and the injectable clock) into the common verifier bean.
+
+### M10. `GlobalExceptionHandler.handleBadRequest` leaks internal exception details and uses the wrong code
+
+**Where:** `common-lib/.../error/GlobalExceptionHandler.java:58-65` — `ProblemFactory.from(ErrorCode.BAD_REQUEST, ex.getMessage())` for `HttpMessageNotReadableException`/`MissingServletRequestParameterException`/`MethodArgumentTypeMismatchException`. Jackson parse messages expose class names/paths; README §4 says malformed bodies map to `VALIDATION_FAILED`. Log the exception, return the canned `VALIDATION_FAILED` title/detail.
+
+### M11. Timing side channel: registered emails are distinguishable by response latency
+
+**Where:** `AuthService.login` (`AuthService.java:108-112`) — when `user == null`, Argon2 (~250 ms by design) is skipped entirely. A remote attacker can enumerate registered accounts by latency. Mitigate with a dummy hash verify when the user is missing (constant-time path), noting the lockout counter already partially covers this.
+
+### M12. `SigningKeyProvider` silently generates a fresh dev key in production if files are missing
+
+**Where:** `SigningKeyProvider.loadOrGenerate` (`SigningKeyProvider.java:48-71`) — `log.warn` + generate 2048-bit key + write to disk. In prod with an unmounted secret path, **each auth replica generates a different key**, tokens issued by pod A fail verification on pod B, and it's only visible in logs. Gate the fallback behind a dev profile (fail fast otherwise); also set restrictive file permissions on the generated private key (currently default umask).
+
+### M13. Missing indexes for prediction symbol lookups and email verification
+
+**Where:** `db-migrations/V3__predictions.sql` — only `ix_predictions_asof`; `PredictionRepository.findBySymbolAtAsOf`/`latestAsOfForSymbol` (`PredictionRepository.java:78-89`) filter on `symbol` → seq scans on a table growing ~1.5k rows/day forever. `V1__auth.sql` — no index on `users.verification_token_hash` for `findByVerificationTokenHash`. Add `CREATE INDEX ... ON predictions (symbol, as_of DESC)` and a partial index on `users (verification_token_hash) WHERE verification_token_hash IS NOT NULL`.
+
+### M14. Unbounded table growth: `login_attempts`, `refresh_tokens` never pruned
+
+**Where:** `V1__auth.sql` — `login_attempts` gets one row per login forever (only read for a 15-min window); `refresh_tokens` families/rotated tokens are never GC'd after expiry+revocation. Add a retention job (delete attempts older than N days; delete tokens expired > N days) or partition by time.
+
+### M15. `predictedPrice` silently assumes the SPY forward return is zero
+
+**Where:** `PredictionBatchService.predictSymbol` (`PredictionBatchService.java:152`) — `predictedPrice = close * exp(ensemble)` where `ensemble` predicts the **excess** (stock − SPY) log return (per §7.4 the target is excess). The exposed `predictedPrice`/`predictedPctChange` therefore embeds an unstated "SPY flat" assumption and will systematically under/over-state for directional markets. Either rename (e.g., `predictedExcessPrice`) or document the semantics in the contract/README; ordering-based consumers are unaffected.
+
+### M16. Helm Deployment hardening gaps
+
+**Where:** `templates/deployment.yaml` — no `securityContext` (`runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, dropped capabilities), no `topologySpreadConstraints`, and a single `resources` block (512Mi/1Gi) for wildly different workloads (gateway vs. prediction pod that must hold the feature table; CronJobs none at all — see H3). Ingress lacks `affinity`/`config` for actuator paths. Add per-service resources and standard pod security context.
+
+### M17. Validation-gate results overstate coverage of the risky paths
+
+**Where:** `tests/e2e/.../ApiJourneysE2ETest.java` — authenticated journeys require an externally provisioned `-Pe2eToken` (there is no register→verify→login e2e; the verification link only exists in `LoggingEmailSender` logs), so the "6/6 journeys" never exercised login→JWT→gateway→service as a *flow*. `tests/perf/.../LoadTest.java:34` defaults `--path=/api/v1/.well-known/jwks.json` — the 15.2k RPS / p95 6 ms G3 number measured a public, unauthenticated JSON blob, not authenticated prediction reads. Make the e2e self-sufficient (seed a verified user, or expose a test-only verification hook) and point the load test at authenticated read endpoints.
+
+### M18. Error-code/status mismatches in the gateway pre-check
+
+**Where:** `JwtPreCheckFilter.problem` (`JwtPreCheckFilter.java:90-109`) — every failure (including "Token expired") is emitted as `code: TOKEN_INVALID`; `common-lib` distinguishes `TOKEN_EXPIRED`. Also `GatewayJwtVerifier` expiry handling collapses "no expiry" and "expired" (`GatewayJwtVerifier.java:75-77`). Minor contract drift between edge and services; align codes with the README error table.
+
+---
+
+## LOW findings
+
+1. **`RequestIdFilter` reflects arbitrary inbound `X-Request-Id`** (`common-lib/.../web/RequestIdFilter.java:21-26`) into the response header and MDC — no length cap or charset check (log/header injection surface). Cap at ~128 chars, `[A-Za-z0-9-]` only.
+2. **Gateway CORS is fully open** (`services/gateway/.../application.yml:13-18`) — `allowedOrigins "*"` + all methods/headers. Fine for a public API, but tighten to the actual web origins before prod.
+3. **`/actuator/prometheus` is public** on every service (`DefaultSecurityAutoConfiguration.java:44`) and the gateway exposes `/actuator` unauthenticated (`JwtPreCheckFilter.java:62`) — metrics/info leak internal detail if service ports are reachable. Restrict to the scrape network.
+4. **`X-Forwarded-For` trusted blindly** (`RequestInfo.clientIp:13-23`, `PlanRateLimitFilter.clientIp:88-96`) — spoofable client-IP attribution (login audit rows) and rate-limit key rotation when not behind a trusted proxy. Use a trusted-proxy allowlist or `server.forward-headers-strategy: NATIVE` with framework config.
+5. **Rate-limit INCR/EXPIRE race** (`PlanRateLimitFilter.java:69-75`) — a crash between leaves an orphaned key without TTL (window-scoped, so a leak not a lockout); use `SET key 0 EX 70 NX` + INCR or a Lua script.
+6. **`JwtVerifier` minor hardening** (`common-lib/.../security/JwtVerifier.java`): no `iat`-in-future check; `stringClaim` uses `String.valueOf` (a list claim becomes `"[a, b]"`); a token without `kid` is tried against all RSA keys (fine, but worth a comment).
+7. **`ModelRegistry.reload` clears before refilling** (`ModelRegistry.java:97-98`) — brief window where readers see an empty registry; swap in a new map atomically. `@PostConstruct` swallows load failures with a warn (acceptable for API pods, but consider failing readiness when `model-dir` is configured and invalid).
+8. **Hard-coded horizons in `PredictionConfig.engineConfig`** (`PredictionConfig.java:19`) — `horizons(List.of(1,5,20))` while everything else is metadata-driven; if the exported model changes horizons, the engine's `target_*` columns silently diverge from training parity. Derive from `metadata.json` (or a property).
+9. **`activateModel` stores `metadata = "{}"`** (`PredictionRepository.java:118`) — the `model_registry.metadata` jsonb column is never populated with real metadata.
+10. **DAY-order semantics after hours** (`OrderService.dayOrderExpiry:175-182`) — a DAY order submitted after the close lives until the *next* session's close; document or expire immediately.
+11. **Unverified-email logins count as lockout failures** (`AuthService.java:113-116`) — speeds up targeted lockout of a known-but-unverified account; consider counting only password failures.
+12. **`listOrders`/prediction `limit` unbounded** (`PaperTradingController.java:75-79`, `PredictionQueryService.getIntradayPredictions:73`) — cap at a sane maximum (e.g., 500) to prevent pathological queries.
+13. **`PARTIALLY_FILLED` is dead vocabulary** — `fillIfWorking` always fills the full remaining quantity (`JdbcOrderRepository.java:138-144`); fine for v1, but document that partial fills don't exist (contract advertises the status).
+14. **Ranking has no staleness signal** — `RankingService.run` happily ranks N-day-old predictions under today's `run_date` when the prediction batch is down; the API has no `stale` field (unlike predictions). Consider exposing one.
+15. **`export_models.py` manifest rewrite** — `(output_dir / "manifest.json")` with `"versions": [version]` drops previously exported versions from the manifest each run.
+16. **CI hygiene** (`.github/workflows/ci.yml`): no `permissions:` block (default broad token); `oasdiff` is downloaded from `releases/latest` (unpinned supply chain); consider pinning by version + checksum.
+17. **`docker-compose.yml` uses `timescale/timescaledb:latest-pg16`** — unpinned tag; pin a digest for reproducible dev envs (WireMock is pinned correctly).
+18. **`GatewayJwtVerifier` duplicates `JwtVerifier`** — the reactive/servlet split is justified, but the copy has already drifted (M9/M18). Extract a framework-free verification core module both can use.
+19. **On-demand ingestion inside a GET handler** (`MarketDataController.getHistory`) — a cache-miss read endpoint performs writes (upserts + stream events); make it async/queued or return 404 and let the ingestion job fill it.
+20. **`WatchlistService.get` doesn't require an account** while `OrderService.submit` does — benign asymmetry, but plan-downgrade handling is undefined: a PREMIUM user with 30 symbols who downgrades keeps all 30 (limit only enforced on `replace`); decide the policy (e.g., freeze changes until ≤10).
+
+---
+
+## Code enhancements (quality, non-bug)
+
+1. **FeatureTable → columnar storage** (`FeatureTable.java`): symbol→rows index + `double[]` per column. Removes 20M+ boxed doubles and the per-row `LinkedHashMap` overhead in the batch path; also makes `sanitize`/`applyExecutionDelay` straight array loops.
+2. **Batch inference as one `DMatrix` per horizon** (`PredictionBatchService.predictSymbol`): 500 one-row JNI calls per horizon could be one 500-row matrix call (XGBoost predicts row-wise) — seconds → milliseconds.
+3. **Reuse the upsert batch setter helpers** — `setNullableDouble`/`toInstant` are duplicated across `JdbcOrderRepository`, `JdbcFillRepository`, `PredictionRepository`; extract a small `JdbcUtils` in common-lib (db-migrations or a shared jdbc module).
+4. **Order state machine**: string statuses (`"NEW"`, `"PARTIALLY_FILLED"`) are scattered across 4 classes with `Set.of` re-declared in `OrderService.ORDER_STATUSES`; introduce an `OrderStatus` enum with `isWorking()` and `canTransitionTo()`.
+5. **Micrometer metrics for the batch jobs**: ingestion accepted/rejected/flagged, batch rows per horizon, fills per poll, quote fallback rate are log-only today; expose counters/timers (`/actuator/prometheus` is already wired).
+6. **`ModelMetadata.HorizonModelMetadata.metrics` accessors**: `PredictionQueryService.getModelInfo:135-137` does `(int)(double) number(...)` gymnastics; add typed getters.
+7. **Constants for magic numbers**: `slippageBps / 10000.0` appears in three classes; `1e-9` epsilon in two; `252` annualization factor inline. Name them.
+8. **Test reuse**: `InMemoryPaperStore` is excellent — consider promoting it (or a Testcontainers Postgres fixture) to cover `AccountService.reset` and multi-thread fill races that the property test's single-thread loop cannot reach.
+
+## Design enhancements (architecture-level)
+
+1. **D1. Central time/convention module.** The root cause of H1 is that "what does a stored timestamp mean" is decided ad hoc per consumer. Add a `common-lib` time API: `dailyBarTs(LocalDate)`, `sessionDateOfDailyBar(Instant)`, `volWindowBefore(asOf)`, used by market-data, prediction and ranking — plus a documented storage convention (§README 3). This also de-risks `bars_5m` vs `bars_daily` semantics.
+2. **D2. Single execution model for scheduled work.** Today every job exists twice (in-pod `@Scheduled` + one-shot CronJob) with no leader election. Choose: CronJob-only (simplest, one-shot runners already exist) and disable in-pod schedules in the prod profile — or add ShedLock and keep in-pod. ConcurrencyPolicy is only per-CronJob; replicas still double-run (see H3/M8).
+3. **D3. Ledger serialization.** The paper ledger is *almost* perfectly safe: conditional order updates + optimistic account cash + TX on fills. The remaining hole (H5) argues for one rule: "all ledger mutations per account serialize through the account row" (`SELECT ... FOR UPDATE` at fill/reset start). Simpler to reason about than mixed optimistic/pessimistic.
+4. **D4. Quote sanity boundary.** Introduce a `QuoteGuard` next to `IngestionQualityGuard` (price>0, ask≥bid, spread sanity, optional staleness) applied at the single point where provider quotes enter the system — market-data already has the right shape for this (guards + fail-open fallbacks).
+5. **D5. Universe governance.** Make the prediction universe an explicit, versioned list (the ingestion job already knows the S&P 500 set); separate "universe symbols" from "user-requested symbols" so on-demand ingestion can't grow the nightly/intraday workloads or the prediction targets (M3/M6).
+6. **D6. Consume or drop `bars.updated`.** The stream is published but nothing reads it; either wire the intended consumer (e.g., paper-trading marking, cache invalidation) or remove it until then (with trimming if kept — M5).
+7. **D7. Verification core shared by gateway and services.** Extract `JwtVerifier`'s parsing/claims logic into a servlet-free module (nimbus is already framework-free); the gateway wraps it reactively. Prevents the drift documented in M9/M18.
+8. **D8. Contract-level validation enforcement.** Turn on the generator's validation annotations (or a hand-written `@Valid` layer) so `required`/`minLength` in the frozen specs are actually enforced at every service edge — currently the specs are documentation, not guarantees (H2).
+
+## Positive observations (verified, not flattery)
+
+1. **The parity harness is genuinely rigorous**: `GoldenParityTest` compares every column with ≤1e-9 tolerance *and* identical NaN patterns; the indicator port reproduces the nastiest pandas semantics correctly (Wilder seeding via `delta.where(delta>0,0)` → EWM seeded at 0; RSI NaN when `avgLoss=0`; `ewm(adjust=false)` seeding; average-tie `rank(pct=True)` with `(less + (equal+1)/2)/n`; ddof=1). I hand-verified these formulas — they are right.
+2. **Refresh-token family rotation with reuse detection, JWKS design, and the k-anonymity breached-password check (fail-open, 5-hex prefix only) are all textbook-correct.**
+3. **The order lifecycle SQL is race-safe where it matters**: `cancel`, `fillIfWorking`, `expireDue` are conditional updates; `fillIfWorking` + the working-status guard make double-fills impossible even across replicas; the `reset` vs. in-flight-fill interleaving is safe due to consistent row-lock ordering (I traced it).
+4. **The jqwik property test targets exactly the classic matching-engine bugs** (cash conservation, non-negative quantities, no duplicate/zero fills) with tight 1e-6 tolerances — the right test design for a ledger.
+5. **Engineering discipline**: contract-first codegen with `oasdiff` breaking-change gate in CI, RFC 7807 everywhere with stable codes, injectable `MarketClock`/`TradingCalendar` (correct NYSE rules incl. the Saturday-New-Year's exception and Meeus/Jones/Butcher Easter — spot-checked), deterministic synthetic provider, coverage exclusions for generated code, and a Docker-only dev sandbox with a shared Gradle cache.
+
+## Appendix A — Findings index by area
+
+| Area | Findings |
+| --- | --- |
+| common-lib | M9, M10, L1, L6 |
+| auth-service | H2, H6, M11, M12, M14 (partial), L11, L20 |
+| gateway | M18, L2, L4, L5 |
+| market-data | H4, M3 (partial), M4, M6, L3, L19 |
+| prediction + feature-engine | H1, M1, M13, M15, L7, L8, L9, E1, E2 |
+| ranking | H1 (vol window), M7, L14, L15 |
+| paper-trading | H5, M2, M8, L10, L12, L13, E4, D3 |
+| infra/CI | H3, M16, L16, L17 |
+| db-migrations | M13, M14 |
+| tests | M17, E8 |
+
+## Appendix B — Recommended fix order
+
+1. H1 (session-date convention) — data correctness foundation; fix before any real staging run.
+2. H3 (Helm CronJobs) — the nightly pipeline is a no-op as shipped.
+3. H2 + M10 (validation + error model) — small, contract-facing.
+4. H4 + D4 (quote sanity) — before opening paper trading to testers.
+5. H5/H6/M8 (ledger/rotation concurrency) — before scaling replicas.
+6. M1/M2 (batch memory/latency) — before the full-universe batch meets real history lengths.
+7. Then MEDIUM remainder and design items as scheduled work.
+
+## Appendix C — Suspicions investigated and disproved (documented so nobody re-litigates them)
+
+1. **JWKS `n`/`e` looked like decimal** (`JwksController.java:38-39` — `key.getModulus().toString()`). In nimbus-jose-jwt 9.40, `getModulus()` returns `Base64URL`, so `toString()` **is** correct base64url. Empirically verified with the exact 9.40 jar: `JWKSet.parse` succeeds and `SignedJWT.verify` returns true against the published format.
+2. **`CREATE TABLE bars_5m (LIKE bars_daily INCLUDING ALL)` looked like it drops the PK** (which would break `ON CONFLICT (symbol, ts)` for intraday upserts). Verified on postgres:16: `INCLUDING ALL` copies the primary key (`bars_5m_pkey`) and the upsert works.
+3. **`capPositions` "fill equal weights when fixedTotal ≥ 1" looked like it could breach the position cap** — traced through the water-filling loop; the equal-weight fill (`1/n`) only triggers when `n × cap ≈ 1`, where `1/n` equals the cap. Correct.
+4. **`bars_5m LIKE` + hypertable ordering, `predictSymbol` excess-target plumbing (`vectorWithPooled` `pooled_pred` substitution), `previousRanks` "most recent earlier run" semantics, lockout counting, JPA `revokeFamily` bulk update, DMatrix disposal in `finally`** — all checked, all correct.
+
+---
+
+## Appendix D — Remediation status (2026-10-09)
+
+All findings and enhancements below were implemented in a follow-up pass; unit
+tests are green across all modules. "Partial" means the code fix is in place but
+an external step (staging, cloud credentials, real models) is still required.
+
+| Finding | Status | What changed |
+| --- | --- | --- |
+| H1 | Fixed | `common-lib::BarTimestamps` defines the 00:00Z session-date convention; prediction/ranking/market-data consumers and the Polygon adapter normalized; regression tests assert a UTC-midnight Monday bar maps to Monday (`PredictionBatchServiceTest`, `BarTimestampsTest`); ADR-0010 |
+| H2 | Fixed | Explicit null/length guards in `AuthService` (register/login/refresh/verify/resend), `@Valid` on controller overrides, malformed bodies now `VALIDATION_FAILED` 400 |
+| H3 | Fixed | CronJob template renders `timeZone: America/New_York`, volumes, `envFromSecrets`, `resources` and securityContext; values wire the model PVC/`PREDICTION_MODEL_DIR`, provider secret; schedules verified via `helm template` |
+| H4 | Fixed | `QuoteGuard` at the market-data boundary (positive/uncrossed/bounded spread), controller rejects invalid provider/cached quotes and falls back to the daily close, `Quote.valid()` re-checked in the matching engine; tests cover zero/crossed quotes |
+| H5 | Fixed | `SELECT … FOR UPDATE` on the account row serializes all ledger mutations; `AccountService.reset` takes the same lock; `InMemoryPaperStore` updated; existing property test still green |
+| H6 | Fixed | `RefreshTokenRepository.revokeIfActive` conditional update is the atomic claim; a losing concurrent replay revokes the family as reuse; tests cover the race |
+| M1 | Fixed | Feature computation/inference/JSON outside any transaction (short `TransactionTemplate` write), columnar `FeatureTable` (`double[]` per column), `sanitize` column list hoisted |
+| M2 | Fixed | New `/stocks/quotes` batch endpoint (additive contract change), `QuoteProvider.quotes` with composite fallback, portfolio/snapshot marking uses one batch call |
+| M3 / D5 | Fixed | `symbol_universe` table (V6), universe registration only at scheduled ingestion, on-demand ingestion limited to known symbols (`allow-on-demand-ingestion`), `trackedSymbols` uses the universe |
+| M4 | Fixed | Explicit connect/read timeouts on the Polygon RestClient and the HIBP client |
+| M5 / D6 | Fixed | `XADD … MAXLEN ~` (configurable `stream-max-length`, default 100k); consumer still absent and documented |
+| M6 | Fixed | Daily ingestion fetches from `latest stored + 1 day` per symbol; full backfill only on first sight |
+| M7 | Fixed | Caps re-enforced on the survivors after dust-drop, iterated to stability; new sector-breach regression test |
+| M8 | Fixed | `@Transactional` on `AccountService.reset` (plus account lock) and `WatchlistService.replace` |
+| M9 | Fixed | `JwtVerifier` 5-arg constructor wired from `JwtProperties.clockSkew`; skew test added |
+| M10 | Fixed | `HttpMessageNotReadable`/param errors map to canned `VALIDATION_FAILED`; exception detail logged, not returned |
+| M11 | Fixed | Unknown-email logins verify against a real dummy Argon2 hash (constant-time path) |
+| M12 | Fixed | `allow-key-generation=false` fails fast in prod; private key written with owner-only POSIX permissions; Helm mounts the signing-key secret |
+| M13 | Fixed | V7 migration adds `predictions (symbol, as_of DESC)` and partial `users (verification_token_hash)` indexes |
+| M14 | Fixed | `RetentionJob` (daily cron) prunes `login_attempts` and expired/revoked `refresh_tokens` with configurable windows |
+| M15 | Fixed | Contract/README document that `predictedPrice` embeds a "SPY flat" assumption (excess-return target) |
+| M16 | Fixed | Pod/container securityContext, `/tmp` emptyDir, topology spread, per-service and per-job resources, probes retained |
+| M17 | Partial | e2e adds a register → login-403 → verify → login journey (verify token via `-Pe2eVerifyToken`/`E2E_VERIFY_TOKEN`, else skipped); perf defaults to an authenticated endpoint and accepts `--token`; a running staging stack is still required for the full run |
+| M18 | Fixed | Gateway maps expired to `TOKEN_EXPIRED`; both verifiers share the new core |
+| L1 | Fixed | `RequestIdFilter` accepts `[A-Za-z0-9-]{1,128}` only, else generates a UUID |
+| L2 | Fixed | CORS origins configurable (`stockpredict.gateway.allowed-origins`) |
+| L3 | Fixed | `stockpredict.security.actuator-public=false` protects `/actuator/prometheus` |
+| L4 | Fixed | `trust-forwarded-for` (default false) gates XFF use in the gateway limiter |
+| L5 | Fixed | Atomic Lua `INCR` + first-hit `EXPIRE`; fail-open preserved |
+| L6 | Fixed | `iat`-in-the-future rejected; `stringClaim` no longer stringifies lists |
+| L7 | Fixed | `ModelRegistry` swaps the pooled map atomically on reload |
+| L8 | Fixed | Engine horizons configurable (`stockpredict.predictions.horizons`) |
+| L9 | Fixed | `model_registry.metadata` stores the real horizon metadata JSON |
+| L10 | Fixed | DAY-order after-hours semantics documented on `dayOrderExpiry` |
+| L11 | Fixed | Unverified-email logins no longer count towards lockout |
+| L12 | Fixed | Order and prediction `limit` clamped to 500 |
+| L13 | Fixed | README notes partial fills do not exist in v1 |
+| L14 | Fixed | `stale` flag added to the ranking response and contract |
+| L15 | Fixed | `export_models.py` merges versions into the manifest instead of replacing it |
+| L16 | Fixed | CI `permissions: contents: read`; oasdiff via pinned action |
+| L17 | Fixed | TimescaleDB image pinned to tag + digest |
+| L18 / D7 | Fixed | `libs/jwt-core::JwtVerificationCore` shared by services and gateway; wrappers map claims/errors (ADR-0009) |
+| L19 | Fixed | On-demand ingestion is best-effort and bounded to known symbols |
+| L20 | Fixed | Plan-downgrade policy: oversized watchlists may only shrink until within the limit |
+| E1 | Fixed | Columnar `FeatureTable` |
+| E2 | Fixed | One `DMatrix` per horizon (`ModelRegistry.predictBatch`) |
+| E3 | Fixed | `common-lib::JdbcUtils` shared nullable-double/timestamp helpers |
+| E4 | Fixed | `OrderStatus` enum with `isWorking()` used by order validation and the in-memory store |
+| E5 | Fixed | Micrometer counters: ingestion outcomes, prediction rows per horizon, paper fills |
+| E6 | Fixed | Typed metric accessors on `HorizonModelMetadata` |
+| E7 | Fixed | Named constants for bps, epsilon and the 252 annualization factor |
+| E8 | Not done | Promoting `InMemoryPaperStore`/a Testcontainers fixture for multi-threaded fill races remains open |
+| D1 | Fixed | `BarTimestamps` + ADR-0010 |
+| D2 | Fixed | Single execution model: prod CronJobs own the batch jobs via `*_SCHEDULING_ENABLED=false`; intraday/matching/snapshot stay in-pod |
+| D3 | Fixed | Account-row serialization for all ledger mutations |
+| D4 | Fixed | `QuoteGuard` at the single provider-quote entry point |
+| D5 | Fixed | Explicit universe vs user-requested symbols |
+| D6 | Fixed | Stream trimmed; consumer still deferred (documented) |
+| D7 | Fixed | Shared framework-free JWT verification core |
+| D8 | Fixed | Contract constraints enforced at the service edge |
+
+Remaining external/operational work is unchanged from §18 (real provider keys,
+trained models, staging G2, multi-cloud G3, UAT, legal review) plus E8.

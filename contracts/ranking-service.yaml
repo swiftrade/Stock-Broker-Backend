@@ -1,0 +1,109 @@
+openapi: 3.1.0
+info:
+  title: Ranking Service API
+  version: 1.0.0
+  description: |
+    Nightly long-term top 10 by predicted 20-day excess return with
+    inverse-volatility weights, position (10%) and sector (25%) caps. Ranking
+    history is retained so users can audit past picks.
+servers:
+  - url: /api/v1
+tags:
+  - name: Recommendations
+paths:
+  /recommendations/long-term:
+    get:
+      tags: [Recommendations]
+      operationId: getLongTermRecommendations
+      summary: Latest long-term top N
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+        - name: date
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Ranking run date; defaults to the latest run
+      responses:
+        '200':
+          description: Ranked picks
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LongTermRanking'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Missing, expired or invalid credentials
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+    LongTermRanking:
+      type: object
+      required: [runDate, modelVersion, stale, disclaimer, picks]
+      properties:
+        runDate: { type: string, format: date }
+        modelVersion: { type: string }
+        stale:
+          type: boolean
+          description: True when the latest run predates the previous trading day (batch job missed)
+        disclaimer: { type: string }
+        picks:
+          type: array
+          items:
+            $ref: '#/components/schemas/RankedPick'
+    RankedPick:
+      type: object
+      required: [symbol, rank, predicted20dReturn, volatility, sector, weight]
+      properties:
+        symbol: { type: string }
+        rank: { type: integer }
+        rankChange:
+          type: integer
+          description: Rank change vs the previous run (positive = improved)
+        predicted20dReturn: { type: number, format: double }
+        volatility: { type: number, format: double }
+        sector: { type: string }
+        weight:
+          type: number
+          format: double
+          description: Inverse-volatility weight after position and sector caps; sums to 1
+        rationale:
+          type: object
+          additionalProperties: true
+          description: Human-readable top contributing features for transparency
+security:
+  - bearerAuth: []

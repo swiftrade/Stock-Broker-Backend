@@ -1,0 +1,19 @@
+{
+  "request": {
+    "method": "GET",
+    "urlPathPattern": "/api/v1/stocks/[A-Z.]+/quote"
+  },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "transformers": ["response-template"],
+    "jsonBody": {
+      "symbol": "{{request.pathSegments.[3]}}",
+      "bid": 100.0,
+      "ask": 100.02,
+      "last": 100.01,
+      "ts": "2026-01-02T15:00:00Z",
+      "stale": false
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.stockpredict.local/events/bars.updated.json",
+  "title": "bars.updated",
+  "description": "Published by market-data-service (Redis Stream: bars.updated) after an ingestion batch commits. Consumed by prediction-service and ranking-service batch jobs. Frozen after gate G0.",
+  "type": "object",
+  "required": ["eventId", "type", "occurredAt", "symbol", "interval", "barCount", "lastBarTs", "source"],
+  "additionalProperties": false,
+  "properties": {
+    "eventId": { "type": "string", "format": "uuid" },
+    "type": { "const": "bars.updated" },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "symbol": { "type": "string", "pattern": "^[A-Z][A-Z0-9.\\-]{0,9}$" },
+    "interval": { "type": "string", "enum": ["1d", "5m"] },
+    "barCount": { "type": "integer", "minimum": 1 },
+    "lastBarTs": { "type": "string", "format": "date-time" },
+    "source": { "type": "string", "enum": ["polygon", "alpaca", "cache"] },
+    "stale": { "type": "boolean", "default": false }
+  }
+}

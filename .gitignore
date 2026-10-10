@@ -1,0 +1,23 @@
+# Gradle / Java
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+out/
+*.class
+*.iml
+.idea/
+*.log
+
+# Secrets
+.env
+.config
+*.key
+*.pem
+
+# Runtime data
+data/
+logs/
+*.parquet
+
+# OS
+.DS_Store

@@ -1,0 +1,27 @@
+{
+  "request": {
+    "method": "GET",
+    "urlPathPattern": "/api/v1/recommendations/long-term"
+  },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "jsonBody": {
+      "runDate": "2026-01-02",
+      "modelVersion": "stub-1.0.0",
+      "disclaimer": "Research signal only. Not investment advice.",
+      "picks": [
+        {
+          "symbol": "MSFT",
+          "rank": 1,
+          "rankChange": 0,
+          "predicted20dReturn": 0.045,
+          "volatility": 0.21,
+          "sector": "Information Technology",
+          "weight": 0.1,
+          "rationale": { "momentum": 0.7, "quality": 0.5 }
+        }
+      ]
+    }
+  }
+}

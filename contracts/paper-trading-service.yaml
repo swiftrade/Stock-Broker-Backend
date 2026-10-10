@@ -1,0 +1,373 @@
+openapi: 3.1.0
+info:
+  title: Paper Trading Service API
+  version: 1.0.0
+  description: |
+    In-house paper-trading engine. Each user has one $100k virtual account.
+    Orders are restricted to the user's watchlist (FREE plan: max 10 symbols,
+    locked for 30 days after a change). Fills are simulated against market
+    quotes in our DB; no broker account is involved and no shorting in v1.
+servers:
+  - url: /api/v1
+tags:
+  - name: PaperTrading
+paths:
+  /paper/watchlist:
+    get:
+      tags: [PaperTrading]
+      operationId: getWatchlist
+      summary: The user's tradable symbol set
+      responses:
+        '200':
+          description: Watchlist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Watchlist'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    put:
+      tags: [PaperTrading]
+      operationId: replaceWatchlist
+      summary: Replace the watchlist (plan limits enforced server-side)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WatchlistUpdateRequest'
+      responses:
+        '200':
+          description: Updated watchlist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Watchlist'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /paper/account:
+    post:
+      tags: [PaperTrading]
+      operationId: openAccount
+      summary: Open the $100k virtual account (idempotent per user)
+      responses:
+        '201':
+          description: Account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /paper/account/reset:
+    post:
+      tags: [PaperTrading]
+      operationId: resetAccount
+      summary: Reset the account to $100k (cancels working orders, clears positions)
+      responses:
+        '200':
+          description: Reset account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /paper/orders:
+    post:
+      tags: [PaperTrading]
+      operationId: submitOrder
+      summary: Submit a market, limit or stop order for a watchlist symbol
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          schema:
+            type: string
+            maxLength: 64
+          description: Optional client key; duplicate submissions return the original order
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderRequest'
+      responses:
+        '201':
+          description: Order accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+    get:
+      tags: [PaperTrading]
+      operationId: listOrders
+      summary: List orders, newest first
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [NEW, PARTIALLY_FILLED, FILLED, CANCELLED, REJECTED, EXPIRED]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+      responses:
+        '200':
+          description: Orders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /paper/orders/{id}:
+    delete:
+      tags: [PaperTrading]
+      operationId: cancelOrder
+      summary: Cancel a working order
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Cancelled
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Order is no longer cancelable
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /paper/positions:
+    get:
+      tags: [PaperTrading]
+      operationId: listPositions
+      summary: Open positions
+      responses:
+        '200':
+          description: Positions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PositionList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /paper/portfolio:
+    get:
+      tags: [PaperTrading]
+      operationId: getPortfolio
+      summary: Cash, P&L, equity and the equity curve
+      responses:
+        '200':
+          description: Portfolio
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Portfolio'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Missing, expired or invalid credentials
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: Not allowed (plan limit or symbol not in watchlist)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Not found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: Conflicting state (e.g. watchlist swap lock, duplicate idempotency key)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unprocessable:
+      description: Valid request that cannot be executed (market closed, insufficient cash)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+    Plan:
+      type: string
+      enum: [FREE, PREMIUM]
+    Watchlist:
+      type: object
+      required: [symbols, plan, limit, lockedUntil]
+      properties:
+        symbols:
+          type: array
+          items: { type: string }
+        plan:
+          $ref: '#/components/schemas/Plan'
+        limit:
+          type: integer
+          description: Maximum symbols for the plan (0 = unlimited)
+        lockedUntil:
+          type: string
+          format: date-time
+          description: Watchlist cannot change before this time (30-day swap lock)
+    WatchlistUpdateRequest:
+      type: object
+      required: [symbols]
+      properties:
+        symbols:
+          type: array
+          items: { type: string }
+          maxItems: 100
+    Account:
+      type: object
+      required: [id, cash, startingCash, equity, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        cash: { type: number, format: double }
+        startingCash: { type: number, format: double }
+        equity: { type: number, format: double }
+        createdAt: { type: string, format: date-time }
+    OrderRequest:
+      type: object
+      required: [symbol, side, type, quantity]
+      properties:
+        symbol: { type: string }
+        side: { type: string, enum: [BUY, SELL] }
+        type: { type: string, enum: [MARKET, LIMIT, STOP] }
+        quantity:
+          type: number
+          format: double
+          exclusiveMinimum: 0
+          description: Share quantity (fractional allowed)
+        limitPrice: { type: number, format: double }
+        stopPrice: { type: number, format: double }
+        timeInForce:
+          type: string
+          enum: [DAY, GTC]
+          default: DAY
+    Order:
+      type: object
+      required: [id, accountId, symbol, side, type, quantity, status, submittedAt]
+      properties:
+        id: { type: string, format: uuid }
+        accountId: { type: string, format: uuid }
+        symbol: { type: string }
+        side: { type: string, enum: [BUY, SELL] }
+        type: { type: string, enum: [MARKET, LIMIT, STOP] }
+        quantity: { type: number, format: double }
+        limitPrice: { type: number, format: double }
+        stopPrice: { type: number, format: double }
+        timeInForce: { type: string, enum: [DAY, GTC] }
+        status:
+          type: string
+          enum: [NEW, PARTIALLY_FILLED, FILLED, CANCELLED, REJECTED, EXPIRED]
+        filledQuantity: { type: number, format: double }
+        avgFillPrice: { type: number, format: double }
+        rejectReason: { type: string }
+        submittedAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    OrderList:
+      type: object
+      required: [orders]
+      properties:
+        orders:
+          type: array
+          items:
+            $ref: '#/components/schemas/Order'
+    Position:
+      type: object
+      required: [symbol, quantity, avgEntryPrice]
+      properties:
+        symbol: { type: string }
+        quantity: { type: number, format: double }
+        avgEntryPrice: { type: number, format: double }
+        marketPrice: { type: number, format: double }
+        marketValue: { type: number, format: double }
+        unrealizedPnl: { type: number, format: double }
+        realizedPnl: { type: number, format: double }
+    PositionList:
+      type: object
+      required: [positions]
+      properties:
+        positions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Position'
+    Portfolio:
+      type: object
+      required: [accountId, cash, positionsValue, equity, realizedPnl, unrealizedPnl, equityCurve]
+      properties:
+        accountId: { type: string, format: uuid }
+        cash: { type: number, format: double }
+        positionsValue: { type: number, format: double }
+        equity: { type: number, format: double }
+        realizedPnl: { type: number, format: double }
+        unrealizedPnl: { type: number, format: double }
+        equityCurve:
+          type: array
+          items:
+            $ref: '#/components/schemas/EquityPoint'
+    EquityPoint:
+      type: object
+      required: [date, equity]
+      properties:
+        date: { type: string, format: date }
+        equity: { type: number, format: double }
+security:
+  - bearerAuth: []

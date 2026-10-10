@@ -1,0 +1,2 @@
+com.stockpredict.common.config.CommonAutoConfiguration
+com.stockpredict.common.config.DefaultSecurityAutoConfiguration

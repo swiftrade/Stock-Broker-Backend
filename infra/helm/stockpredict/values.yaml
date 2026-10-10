@@ -1,0 +1,147 @@
+global:
+  imageRegistry: ghcr.io/your-org/stockpredict
+  imageTag: "0.1.0-SNAPSHOT"
+  imagePullSecrets: []
+  jwtIssuer: https://auth.stockpredict.example
+  jwtAudience: stockpredict-api
+  jwtJwksUri: http://auth-service:8081/api/v1/.well-known/jwks.json
+  # All batch CronJob schedules are interpreted in this timezone (k8s >= 1.27).
+  timeZone: America/New_York
+
+# External managed services (no in-cluster databases in production).
+postgres:
+  url: jdbc:postgresql://postgres.example:5432/stockpredict
+  secretName: stockpredict-db
+redis:
+  host: redis.example
+  port: 6379
+
+ingress:
+  enabled: true
+  className: nginx
+  host: api.stockpredict.example
+  tlsSecret: stockpredict-tls
+
+# Pod-level hardening applied to Deployments and CronJobs.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# Default resources; override per service / per batch job where needed.
+resources:
+  requests: { cpu: 250m, memory: 512Mi }
+  limits: { cpu: "1", memory: 1Gi }
+
+services:
+  auth-service:
+    image: auth-service
+    port: 8081
+    replicas: 2
+    javaOpts: "-XX:MaxRAMPercentage=70"
+    env:
+      AUTH_JWT_ALLOW_KEY_GENERATION: "false"
+      AUTH_JWT_PRIVATE_KEY_PATH: /etc/stockpredict/keys/private.pem
+      AUTH_JWT_PUBLIC_KEY_PATH: /etc/stockpredict/keys/public.pem
+    volumes:
+      - name: signing-keys
+        mountPath: /etc/stockpredict/keys
+        secretName: stockpredict-auth-keys
+        readOnly: true
+  market-data-service:
+    image: market-data-service
+    port: 8082
+    replicas: 2
+    env:
+      MARKET_DATA_PROVIDER: auto
+      # Nightly backfill runs as the market-data-ingest CronJob in production.
+      MARKET_DATA_DAILY_SCHEDULING_ENABLED: "false"
+    envFromSecrets: [stockpredict-market-data]
+  prediction-service:
+    image: prediction-service
+    port: 8083
+    replicas: 2
+    env:
+      PREDICTION_MODEL_DIR: /models/active
+      # Pre-market batch runs as the prediction-batch CronJob in production.
+      PREDICTION_SCHEDULING_ENABLED: "false"
+    volumes:
+      - name: models
+        mountPath: /models
+        claimName: stockpredict-models
+    resources:
+      requests: { cpu: 500m, memory: 1Gi }
+      limits: { cpu: "2", memory: 3Gi }
+  ranking-service:
+    image: ranking-service
+    port: 8084
+    replicas: 2
+    env:
+      RANKING_SECTOR_MAP: /models/sectors.json
+      # Nightly ranking runs as the ranking-batch CronJob in production.
+      RANKING_SCHEDULING_ENABLED: "false"
+    volumes:
+      - name: models
+        mountPath: /models
+        claimName: stockpredict-models
+  paper-trading-service:
+    image: paper-trading-service
+    port: 8085
+    replicas: 2
+  gateway:
+    image: gateway
+    port: 8080
+    replicas: 3
+    env:
+      AUTH_SERVICE_URL: http://auth-service:8081
+      MARKET_DATA_SERVICE_URL: http://market-data-service:8082
+      PREDICTION_SERVICE_URL: http://prediction-service:8083
+      RANKING_SERVICE_URL: http://ranking-service:8084
+      PAPER_SERVICE_URL: http://paper-trading-service:8085
+      STOCKPREDICT_GATEWAY_RATE_LIMIT_ENABLED: "true"
+
+# One-shot CronJobs for the batch agents (they exit when the batch completes).
+# These are the single execution model in production; the in-pod schedules are
+# disabled via the *_SCHEDULING_ENABLED env flags above (D2).
+batchJobs:
+  prediction-batch:
+    image: prediction-service
+    schedule: "30 8 * * TUE-SAT"
+    env:
+      PREDICTION_RUN_BATCH_ONCE: "true"
+      PREDICTION_MODEL_DIR: /models/active
+    volumes:
+      - name: models
+        mountPath: /models
+        claimName: stockpredict-models
+    resources:
+      requests: { cpu: 500m, memory: 1Gi }
+      limits: { cpu: "2", memory: 3Gi }
+  ranking-batch:
+    image: ranking-service
+    schedule: "0 2 * * TUE-SAT"
+    env:
+      RANKING_RUN_BATCH_ONCE: "true"
+      RANKING_SECTOR_MAP: /models/sectors.json
+    volumes:
+      - name: models
+        mountPath: /models
+        claimName: stockpredict-models
+  market-data-ingest:
+    image: market-data-service
+    schedule: "15 6 * * TUE-SAT"
+    env:
+      MARKET_DATA_RUN_INGEST_ONCE: "true"
+    envFromSecrets: [stockpredict-market-data]
+    resources:
+      requests: { cpu: 500m, memory: 1Gi }
+      limits: { cpu: "2", memory: 2Gi }

@@ -1,0 +1,55 @@
+server:
+  port: 8082
+  servlet:
+    context-path: /api/v1
+
+spring:
+  application:
+    name: market-data-service
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/stockpredict}
+    username: ${SPRING_DATASOURCE_USERNAME:stockpredict}
+    password: ${SPRING_DATASOURCE_PASSWORD:stockpredict}
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,info
+
+stockpredict:
+  jwt:
+    issuer: ${STOCKPREDICT_JWT_ISSUER:https://auth.stockpredict.local}
+    audience: ${STOCKPREDICT_JWT_AUDIENCE:stockpredict-api}
+    jwks-uri: ${STOCKPREDICT_JWT_JWKS_URI:http://localhost:8081/api/v1/.well-known/jwks.json}
+  market-data:
+    provider: ${MARKET_DATA_PROVIDER:auto}
+    polygon-api-key: ${POLYGON_API_KEY:}
+    polygon-connect-timeout: PT5S
+    polygon-read-timeout: PT30S
+    daily-backfill-years: 5
+    intraday-days: 30
+    daily-cron: "${MARKET_DATA_DAILY_CRON:0 15 6 * * TUE-SAT}"
+    daily-scheduling-enabled: ${MARKET_DATA_DAILY_SCHEDULING_ENABLED:true}
+    run-ingest-once: ${MARKET_DATA_RUN_INGEST_ONCE:false}
+    quote-cache-ttl-seconds: 60
+    allow-on-demand-ingestion: ${MARKET_DATA_ALLOW_ON_DEMAND_INGESTION:true}
+    stream-max-length: 100000
+    fallback-symbols: AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,BRK.B,JPM,V
+    market-symbols: SPY,QQQ,IWM
+    sector-etfs: XLK,XLF,XLE,XLI,XLP,XLU,XLV,XLY,XLB,XLRE,XLC
+    guard:
+      future-tolerance: PT5M
+      intraday-staleness: PT30M
+      max-deviation-pct: 0.35
+
+logging:
+  level:
+    com.stockpredict: INFO

@@ -1,0 +1,19 @@
+{
+  "request": {
+    "method": "GET",
+    "urlPathPattern": "/api/v1/paper/portfolio"
+  },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "jsonBody": {
+      "accountId": "00000000-0000-0000-0000-0000000000aa",
+      "cash": 100000.0,
+      "positionsValue": 0.0,
+      "equity": 100000.0,
+      "realizedPnl": 0.0,
+      "unrealizedPnl": 0.0,
+      "equityCurve": []
+    }
+  }
+}

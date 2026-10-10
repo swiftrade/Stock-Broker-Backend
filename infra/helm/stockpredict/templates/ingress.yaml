@@ -1,0 +1,40 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gateway
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 1m
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - hosts: [{{ .Values.ingress.host }}]
+      secretName: {{ .Values.ingress.tlsSecret }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port: { number: 8080 }
+{{- end }}
+---
+# Secrets are never stored in the chart: External Secrets Operator pulls them
+# from the cloud secret manager (GCP Secret Manager / AWS Secrets Manager /
+# Azure Key Vault) into this Kubernetes secret.
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: stockpredict-db
+spec:
+  refreshInterval: 1h
+  secretStoreRef: { name: cloud-secret-store, kind: ClusterSecretStore }
+  target: { name: stockpredict-db }
+  data:
+    - secretKey: username
+      remoteRef: { key: stockpredict/db-username }
+    - secretKey: password
+      remoteRef: { key: stockpredict/db-password }

@@ -1,0 +1,28 @@
+{
+  "request": {
+    "method": "GET",
+    "urlPathPattern": "/api/v1/predictions/intraday"
+  },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "jsonBody": {
+      "asOf": "2026-01-02",
+      "modelVersion": "stub-1.0.0",
+      "stale": false,
+      "disclaimer": "Research signal only. Not investment advice.",
+      "predictions": [
+        {
+          "symbol": "AAPL",
+          "rank": 1,
+          "predictedLogReturn": 0.0123,
+          "predictedPctChange": 1.24,
+          "pUp": 0.61,
+          "confidence": 0.61,
+          "currentClose": 230.5,
+          "predictedPrice": 233.36
+        }
+      ]
+    }
+  }
+}
